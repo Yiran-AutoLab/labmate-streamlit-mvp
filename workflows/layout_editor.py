@@ -50,14 +50,24 @@ def apply_layout_operations(
             mask = _liquid_mask(contents, operation["liquid_name"])
             contents.loc[mask, "source_labware"] = operation["source_labware"]
             contents.loc[mask, "source_well"] = operation.get("source_well", operation.get("source_position", ""))
+        elif op == "CONSOLIDATE_SOURCES":
+            contents = _consolidate_sources(
+                contents,
+                operation.get("source_labware", "SourcePlate_1"),
+                operation.get("start_well", "A1"),
+            )
         elif op == "ADD_REPLICATE":
             layout, contents = _add_replicate(layout, contents, int(operation.get("count", 1)))
         elif op == "REMOVE_REPLICATE":
             layout, contents = _remove_replicate(layout, contents, int(operation.get("count", 1)))
         elif op == "REGENERATE_LAYOUT_WITH_CONSTRAINTS":
-            old_wells = layout["well"].tolist()
-            layout = reorder_layout(layout.sort_values(["condition", "sample", "label"]), "row")
-            contents = _remap_contents(contents, dict(zip(old_wells, layout["well"].tolist())))
+            constraint_text = str(operation.get("constraint_text", ""))
+            if _mentions_source_consolidation(constraint_text):
+                contents = _consolidate_sources(contents, "SourcePlate_1", "A1")
+            else:
+                old_wells = layout["well"].tolist()
+                layout = reorder_layout(layout.sort_values(["condition", "sample", "label"]), "row")
+                contents = _remap_contents(contents, dict(zip(old_wells, layout["well"].tolist())))
 
     diff = build_combined_diff(before_layout, layout, before_contents, contents)
     return layout.reset_index(drop=True), contents.reset_index(drop=True), diff
@@ -159,6 +169,41 @@ def _liquid_mask(contents: pd.DataFrame, liquid_name: object) -> pd.Series:
     names = contents["liquid_name"].map(_normalize_liquid)
     roles = contents["liquid_role"].map(_normalize_liquid)
     return names.eq(wanted) | roles.eq(wanted) | names.str.contains(wanted, regex=False) | names.map(lambda value: wanted in value)
+
+
+def _mentions_source_consolidation(text: str) -> bool:
+    lowered = text.lower()
+    has_source = "source" in lowered or "来源" in text
+    has_plate = "plate" in lowered or "板" in text
+    has_single = any(token in text for token in ["一个板", "同一个板", "一个板子", "同一块板", "一块板"])
+    has_all = any(token in text for token in ["都", "全部", "所有", "all"])
+    return has_source and has_plate and (has_single or has_all)
+
+
+def _consolidate_sources(contents: pd.DataFrame, source_labware: str, start_well: str = "A1") -> pd.DataFrame:
+    result = contents.copy()
+    source_labware = str(source_labware or "SourcePlate_1").strip()
+    start_well = str(start_well or "A1").strip().upper()
+    start_index = VALID_WELLS.index(start_well) if start_well in VALID_WELLS else 0
+    source_wells = VALID_WELLS[start_index:]
+
+    unique_liquids = (
+        result[["liquid_name", "liquid_role"]]
+        .drop_duplicates()
+        .sort_values(["liquid_role", "liquid_name"])
+        .reset_index(drop=True)
+    )
+    if len(unique_liquids) > len(source_wells):
+        raise ValueError("Not enough wells to place all source liquids on one 96-well source plate.")
+
+    for idx, row in enumerate(unique_liquids.itertuples(index=False)):
+        mask = (
+            result["liquid_name"].astype(str).eq(str(row.liquid_name))
+            & result["liquid_role"].astype(str).eq(str(row.liquid_role))
+        )
+        result.loc[mask, "source_labware"] = source_labware
+        result.loc[mask, "source_well"] = source_wells[idx]
+    return result
 
 
 def _move_well(layout: pd.DataFrame, contents: pd.DataFrame, source_well: str, dest_well: str) -> tuple[pd.DataFrame, pd.DataFrame]:

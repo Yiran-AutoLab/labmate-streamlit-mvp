@@ -23,6 +23,7 @@ def parse_correction_command(
     operations = payload.get("operations", payload if isinstance(payload, list) else [])
     if not isinstance(operations, list):
         raise ValueError("LLM correction response must contain an operations list.")
+    operations = _normalize_source_consolidation(command, operations)
     return operations
 
 
@@ -75,6 +76,19 @@ def mock_parse_correction_command(command: str) -> list[dict[str, Any]]:
             }
         )
 
+    if _mentions_source_consolidation(text):
+        labware_match = re.search(r"(?:到|在|to|into)\s*([\w_-]*(?:plate|板|板子)[\w_-]*)", text, flags=re.IGNORECASE)
+        source_labware = labware_match.group(1) if labware_match else "SourcePlate_1"
+        if source_labware in {"一个板", "一个板子", "同一个板", "同一个板子", "一块板", "同一块板"}:
+            source_labware = "SourcePlate_1"
+        operations.append(
+            {
+                "op": "CONSOLIDATE_SOURCES",
+                "source_labware": source_labware,
+                "start_well": "A1",
+            }
+        )
+
     if re.search(r"fill.*column|按列|column", text, flags=re.IGNORECASE):
         operations.append({"op": "FILL_BY_COLUMN"})
     if re.search(r"fill.*row|按行|row", text, flags=re.IGNORECASE):
@@ -102,6 +116,25 @@ def _extract_wells(text: str) -> list[str]:
     return [well.upper() for well in re.findall(r"[A-Ha-h](?:[1-9]|1[0-2])", text)]
 
 
+def _mentions_source_consolidation(text: str) -> bool:
+    lowered = text.lower()
+    has_source = "source" in lowered or "来源" in text
+    has_single_labware = any(token in text for token in ["一个板", "同一个板", "一个板子", "同一块板", "一块板"])
+    has_plate = "plate" in lowered or "板" in text
+    has_all = any(token in text for token in ["都", "全部", "所有", "all"])
+    return has_source and has_plate and (has_single_labware or has_all)
+
+
+def _normalize_source_consolidation(command: str, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not _mentions_source_consolidation(command):
+        return operations
+    if any(operation.get("op") == "CONSOLIDATE_SOURCES" for operation in operations):
+        return operations
+    concrete_ops = [operation for operation in operations if operation.get("op") != "REGENERATE_LAYOUT_WITH_CONSTRAINTS"]
+    concrete_ops.append({"op": "CONSOLIDATE_SOURCES", "source_labware": "SourcePlate_1", "start_well": "A1"})
+    return concrete_ops
+
+
 def _correction_system_prompt() -> str:
     return """You parse natural language plate layout correction commands into JSON operations.
 Return ONLY JSON with this shape:
@@ -117,6 +150,7 @@ Supported operations:
 - FILL_BY_COLUMN: no extra fields
 - CHANGE_VOLUME: liquid_name, volume_ul
 - CHANGE_SOURCE: liquid_name, source_labware, source_well
+- CONSOLIDATE_SOURCES: source_labware, start_well. Use this when the user asks to put all source liquids into one source plate/labware.
 - ADD_REPLICATE: count
 - REMOVE_REPLICATE: count
 - REGENERATE_LAYOUT_WITH_CONSTRAINTS: constraint_text

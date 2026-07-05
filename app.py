@@ -528,8 +528,20 @@ def main() -> None:
             "Correction command",
             key="correction_command",
             height=120,
-            placeholder="Examples: move A1 to H12; swap A1 and A2; avoid A1,A2; change water volume to 6 uL; fill by column",
+            placeholder="Examples: source都放在一个板子; 把master mix放到SourcePlate_1 A1; move A1 to H12; avoid A1,A2",
         )
+        with st.expander("Command examples"):
+            st.markdown(
+                """
+                - `source都放在一个板子`
+                - `把所有source合并到SourcePlate_1，从A1开始`
+                - `把master mix的source改到SourcePlate_1 A1`
+                - `把A1移到H12`
+                - `交换A1和A2`
+                - `避开A1,A2`
+                - `把water体积改成6 uL`
+                """
+            )
         if st.button("Apply Correction"):
             try:
                 apply_correction()
