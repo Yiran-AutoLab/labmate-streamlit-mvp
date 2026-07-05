@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+outputs/generated/
+outputs/latest/
+outputs/test_run/
+.env
+.streamlit/labmate_secrets.json
+.streamlit/secrets.toml
+.venv/
+venv/
+.DS_Store
