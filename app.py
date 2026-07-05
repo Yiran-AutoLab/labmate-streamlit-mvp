@@ -309,6 +309,7 @@ def display_source_target_overview() -> None:
     )
     if not validation_passed(st.session_state.validation_report):
         st.warning("This is a transfer preview for human review. Formal Hamilton export is enabled only after validation passes.")
+    st.info("To correct the design conversationally, open the Review Chat tab. The agent will preview its interpretation before applying any change.")
 
 
 def save_source_edits(source_map: pd.DataFrame) -> None:
@@ -566,6 +567,14 @@ def main() -> None:
 
     if st.session_state.spec is None:
         st.info("Generate a draft layout to start reviewing the plate.")
+        st.subheader("Review Chat")
+        st.warning("Review Chat is available after a draft layout is generated, because the agent needs source/target tables to preview what would change.")
+        st.text_area(
+            "Message the agent",
+            value="先生成 draft 后，就可以在这里说：source都放在一个板子；不对，只改master mix；把A1移到H12。",
+            height=100,
+            disabled=True,
+        )
         return
 
     display_source_target_overview()
@@ -573,7 +582,7 @@ def main() -> None:
     edit_tab, correction_tab, validation_export_tab, raw_tab = st.tabs(
         [
             "Table Editor",
-            "AI Correction",
+            "Review Chat",
             "Validate & Export",
             "Raw Review Tables",
         ]
@@ -616,7 +625,8 @@ def main() -> None:
             st.rerun()
 
     with correction_tab:
-        st.subheader("Review Chat")
+        st.subheader("Chat With The Layout Agent")
+        st.caption("The agent will interpret your message first. Nothing changes until you approve the proposed operation.")
         if st.session_state.correction_chat:
             for item in st.session_state.correction_chat[-8:]:
                 with st.chat_message(item["role"]):
@@ -625,10 +635,10 @@ def main() -> None:
             st.info("Tell the agent what looks wrong. It will explain the proposed operation before changing any tables.")
 
         st.text_area(
-            "Correction command",
+            "Message the agent",
             key="correction_command",
             height=120,
-            placeholder="Examples: source都放在一个板子; 把master mix放到SourcePlate_1 A1; move A1 to H12; avoid A1,A2",
+            placeholder="例如：source都放在一个板子；不对，我的意思是只改master mix，不要动template；把A1移到H12",
         )
         with st.expander("Command examples"):
             st.markdown(
@@ -642,7 +652,7 @@ def main() -> None:
                 - `把water体积改成6 uL`
                 """
             )
-        if st.button("Interpret Command", type="primary"):
+        if st.button("Send To AI For Interpretation", type="primary"):
             try:
                 interpret_correction()
                 st.rerun()
