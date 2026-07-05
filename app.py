@@ -90,6 +90,9 @@ def initialize_state() -> None:
         "diff": pd.DataFrame(),
         "correction_command": "",
         "parsed_operations": [],
+        "pending_operations": [],
+        "pending_diff": pd.DataFrame(),
+        "correction_chat": [],
         "ai_review": "",
         "confirmed": False,
         "llm_provider": saved_llm.get("provider", "OpenRouter"),
@@ -387,20 +390,51 @@ def generate_draft_layout() -> None:
     st.session_state.well_contents = generate_well_contents(st.session_state.plate_layout, spec)
     st.session_state.diff = pd.DataFrame()
     st.session_state.parsed_operations = []
+    st.session_state.pending_operations = []
+    st.session_state.pending_diff = pd.DataFrame()
+    st.session_state.correction_chat = []
     st.session_state.ai_review = ""
     st.session_state.confirmed = False
     regenerate_derived_tables()
     run_validation()
 
 
-def apply_correction() -> None:
-    command = st.session_state.correction_command
+def interpret_correction() -> None:
+    command = st.session_state.correction_command.strip()
+    if not command:
+        raise ValueError("Enter a correction command first.")
     operations = parse_correction_command(
         command,
         provider=st.session_state.llm_provider,
         model=st.session_state.llm_model,
         api_key=resolve_api_key(st.session_state.llm_provider, st.session_state.llm_api_key),
     )
+    _, _, preview_diff = apply_layout_operations(
+        st.session_state.plate_layout,
+        st.session_state.well_contents,
+        operations,
+    )
+    st.session_state.pending_operations = operations
+    st.session_state.pending_diff = preview_diff
+    st.session_state.parsed_operations = operations
+    st.session_state.correction_chat.append(
+        {
+            "role": "user",
+            "message": command,
+        }
+    )
+    st.session_state.correction_chat.append(
+        {
+            "role": "assistant",
+            "message": summarize_operations(operations, preview_diff),
+        }
+    )
+
+
+def apply_pending_correction() -> None:
+    operations = st.session_state.pending_operations
+    if not operations:
+        raise ValueError("No pending correction to apply.")
     before = st.session_state.plate_layout.copy()
     layout, contents, diff = apply_layout_operations(
         st.session_state.plate_layout,
@@ -411,9 +445,68 @@ def apply_correction() -> None:
     st.session_state.well_contents = contents
     st.session_state.diff = diff if not diff.empty else build_diff(before, layout)
     st.session_state.parsed_operations = operations
+    st.session_state.pending_operations = []
+    st.session_state.pending_diff = pd.DataFrame()
+    st.session_state.correction_chat.append(
+        {
+            "role": "assistant",
+            "message": "Applied the confirmed correction and reran validation.",
+        }
+    )
     sync_sources_from_well_contents()
     regenerate_derived_tables()
     run_validation()
+
+
+def reject_pending_correction() -> None:
+    if st.session_state.pending_operations:
+        st.session_state.correction_chat.append(
+            {
+                "role": "assistant",
+                "message": "Rejected the pending correction. No table rows were changed.",
+            }
+        )
+    st.session_state.pending_operations = []
+    st.session_state.pending_diff = pd.DataFrame()
+
+
+def summarize_operations(operations: list[dict], diff: pd.DataFrame) -> str:
+    if not operations:
+        return "I could not identify a concrete operation."
+
+    lines = ["I understand this as:"]
+    for operation in operations:
+        op = operation.get("op", "")
+        if op == "CONSOLIDATE_SOURCES":
+            lines.append(
+                f"- Put all source liquids into `{operation.get('source_labware', 'SourcePlate_1')}`, starting at `{operation.get('start_well', 'A1')}`."
+            )
+            lines.append("- Do not change the target plate layout.")
+        elif op == "CHANGE_SOURCE":
+            lines.append(
+                f"- Move `{operation.get('liquid_name', '')}` source to `{operation.get('source_labware', '')} {operation.get('source_well', '')}`."
+            )
+        elif op == "CHANGE_VOLUME":
+            lines.append(f"- Change `{operation.get('liquid_name', '')}` volume to `{operation.get('volume_ul', '')} uL`.")
+        elif op == "MOVE_WELL":
+            lines.append(f"- Move target well `{operation.get('source_well', '')}` to `{operation.get('dest_well', '')}`.")
+        elif op == "SWAP_WELLS":
+            lines.append(f"- Swap target wells `{operation.get('well_a', '')}` and `{operation.get('well_b', '')}`.")
+        elif op == "AVOID_WELLS":
+            lines.append(f"- Avoid target wells `{', '.join(operation.get('wells', []))}`.")
+        elif op in {"FILL_BY_ROW", "FILL_BY_COLUMN", "GROUP_BY", "ADD_REPLICATE", "REMOVE_REPLICATE"}:
+            lines.append(f"- Apply `{op}` with parameters `{operation}`.")
+        else:
+            lines.append(f"- Apply `{op}` with parameters `{operation}`.")
+
+    if diff.empty:
+        lines.append("")
+        lines.append("Preview result: no rows would change. You may need to clarify the command.")
+    else:
+        lines.append("")
+        lines.append(f"Preview result: `{len(diff)}` row-level changes would be made.")
+    lines.append("Review this, then choose Apply or Reject.")
+    return "\n".join(lines)
 
 
 def save_direct_edits(plate_layout: pd.DataFrame, well_contents: pd.DataFrame, source_map: pd.DataFrame) -> None:
@@ -523,7 +616,14 @@ def main() -> None:
             st.rerun()
 
     with correction_tab:
-        st.subheader("Correct The Layout By Talking To The Agent")
+        st.subheader("Review Chat")
+        if st.session_state.correction_chat:
+            for item in st.session_state.correction_chat[-8:]:
+                with st.chat_message(item["role"]):
+                    st.markdown(item["message"])
+        else:
+            st.info("Tell the agent what looks wrong. It will explain the proposed operation before changing any tables.")
+
         st.text_area(
             "Correction command",
             key="correction_command",
@@ -542,21 +642,43 @@ def main() -> None:
                 - `把water体积改成6 uL`
                 """
             )
-        if st.button("Apply Correction"):
+        if st.button("Interpret Command", type="primary"):
             try:
-                apply_correction()
-                if st.session_state.diff.empty:
-                    st.warning("The command was parsed, but no matching layout/content/source rows changed.")
-                else:
-                    st.success("Correction applied and validation rerun.")
+                interpret_correction()
+                st.rerun()
             except Exception as exc:
                 st.error(f"LLM correction parsing failed: {exc}")
-        if st.session_state.parsed_operations:
-            st.write("Parsed operations")
+
+        if st.session_state.pending_operations:
+            st.subheader("Pending Operation")
+            st.json(st.session_state.pending_operations)
+            st.subheader("Preview Diff")
+            if st.session_state.pending_diff.empty:
+                st.warning("No rows would change. Reject this or clarify your command.")
+            else:
+                st.dataframe(st.session_state.pending_diff, use_container_width=True, hide_index=True)
+
+            apply_col, reject_col = st.columns([1, 1])
+            with apply_col:
+                if st.button("Apply Proposed Change", type="primary", use_container_width=True):
+                    try:
+                        apply_pending_correction()
+                        st.success("Confirmed change applied.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Applying correction failed: {exc}")
+            with reject_col:
+                if st.button("Reject / Try Again", use_container_width=True):
+                    reject_pending_correction()
+                    st.rerun()
+
+        if st.session_state.parsed_operations and not st.session_state.pending_operations:
+            st.write("Last applied operations")
             st.json(st.session_state.parsed_operations)
-        st.subheader("8. Diff View")
+
+        st.subheader("Applied Diff View")
         if st.session_state.diff.empty:
-            st.info("No layout changes to show yet.")
+            st.info("No applied changes to show yet.")
         else:
             st.dataframe(st.session_state.diff, use_container_width=True, hide_index=True)
         st.subheader("Ask AI To Review")
