@@ -28,6 +28,43 @@ Then open:
 http://localhost:8501
 ```
 
+## Run
+
+Streamlit demo:
+
+```bash
+streamlit run app.py
+```
+
+FastAPI backend:
+
+```bash
+uvicorn backend.main:app --reload --port 8000
+```
+
+React frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Then open:
+
+```text
+http://127.0.0.1:3000
+```
+
+## Private Hosted Demo
+
+The Next.js client no longer sends LLM provider keys. FastAPI reads them from server environment
+variables, and the hosted API can be protected with `DEMO_ACCESS_CODE`, CORS restrictions, and basic
+per-IP rate limiting. A browser refresh restores the current in-memory experiment when the backend
+process is still running.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the Render + Vercel setup.
+
 ## Current MVP Behavior
 
 The app now uses a real LLM for protocol interpretation, correction parsing, and review. Configure the provider in the Streamlit sidebar:

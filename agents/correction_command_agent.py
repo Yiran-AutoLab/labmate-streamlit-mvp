@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -8,17 +9,18 @@ from agents.llm_client import chat_json
 
 def parse_correction_command(
     command: str,
+    context: dict | None = None,
     *,
-    provider: str,
-    model: str,
-    api_key: str,
+    provider: str = "OpenRouter",
+    model: str = "openrouter/free",
+    api_key: str | None = None,
 ) -> list[dict[str, Any]]:
     payload = chat_json(
         provider=provider,
         model=model,
         api_key=api_key,
         system_prompt=_correction_system_prompt(),
-        user_prompt=command,
+        user_prompt=_correction_user_prompt(command, context),
     )
     operations = payload.get("operations", payload if isinstance(payload, list) else [])
     if not isinstance(operations, list):
@@ -140,6 +142,14 @@ def _correction_system_prompt() -> str:
 Return ONLY JSON with this shape:
 {"operations":[{"op":"MOVE_WELL","source_well":"A1","dest_well":"H12"}]}
 
+The user is editing an existing liquid-handling layout.
+Interpret the latest user correction relative to the current tables.
+Use edit_history to understand what has already been changed.
+Use the initial draft only as reference for what the first generated result looked like.
+The current explicit user command has highest priority.
+Do not directly edit tables.
+Return only structured operations in the supported operation schema.
+
 Supported operations:
 - MOVE_WELL: source_well, dest_well
 - SWAP_WELLS: well_a, well_b
@@ -156,3 +166,14 @@ Supported operations:
 - REGENERATE_LAYOUT_WITH_CONSTRAINTS: constraint_text
 
 Use valid well addresses like A1-H12. Prefer specific operations over regenerate."""
+
+
+def _correction_user_prompt(command: str, context: dict | None) -> str:
+    if not context:
+        return command
+    return (
+        "Correction context JSON:\n"
+        + json.dumps(context, ensure_ascii=False)
+        + "\n\nLatest user command:\n"
+        + command
+    )

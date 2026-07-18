@@ -7,6 +7,7 @@ import pandas as pd
 
 from agents.llm_client import chat_json
 from models.plate_models import PLATE_LAYOUT_COLUMNS, VALID_WELLS, WELL_CONTENT_COLUMNS, PlateLayoutRow, dataclass_rows_to_df
+from workflows.source_allocator import assign_invalid_source_wells
 
 
 def protocol_to_layout(
@@ -215,6 +216,8 @@ def _normalize_llm_layout_payload(protocol: str, payload: dict[str, Any]) -> dic
         source["source_well"] = str(source["source_well"]).upper()
         source["available_volume_ul"] = float(source.get("available_volume_ul") or 0)
 
+    well_contents, sources = assign_invalid_source_wells(well_contents, sources)
+
     return {
         "protocol_text": protocol,
         "workflow_name": payload.get("workflow_name", payload.get("experiment_type", "Custom liquid handling workflow")),
@@ -322,8 +325,8 @@ def _normalize_sources(raw_sources: Any, layout_df: pd.DataFrame, well_contents:
         }
         normalized[key] = source
 
-    samples = sorted(set(layout_df["sample"].astype(str)))
-    conditions = sorted(set(layout_df["condition"].astype(str)))
+    samples = sorted({value for value in layout_df["sample"].astype(str).str.strip() if value})
+    conditions = sorted({value for value in layout_df["condition"].astype(str).str.strip() if value})
     for sample in samples:
         if sample.upper() != "NTC" and sample not in normalized:
             candidate = _find_source_by_name(normalized, sample)

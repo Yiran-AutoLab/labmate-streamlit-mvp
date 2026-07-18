@@ -5,26 +5,38 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from agents.correction_command_agent import parse_correction_command
 from agents.llm_client import load_saved_llm_settings, resolve_api_key, save_llm_settings
 from agents.llm_reviewer import review_layout
-from agents.protocol_to_layout_agent import protocol_to_layout
 from models.plate_models import (
     PLATE_LAYOUT_COLUMNS,
-    SOURCE_MAP_COLUMNS,
     TRANSFER_COLUMNS,
     VALIDATION_COLUMNS,
     WELL_CONTENT_COLUMNS,
-    ensure_columns,
 )
 from outputs.excel_writer import build_excel_workbook
-from validators.layout_validator import validate_layout
-from validators.source_validator import validate_sources, validation_results_to_df
-from validators.volume_validator import validate_volumes
-from workflows.layout_editor import apply_layout_operations, build_diff
-from workflows.layout_generator import build_plate_matrix, summary_matrix
-from workflows.transfer_compiler import compile_hamilton_transfers
-from workflows.well_contents_generator import generate_source_map, generate_well_contents
+from services.correction_service import (
+    apply_confirmed_correction,
+    build_correction_context as service_build_correction_context,
+    interpret_correction_command,
+    summarize_dataframe_for_llm,
+)
+from services.experiment_service import (
+    generate_draft_experiment,
+    save_source_edits as service_save_source_edits,
+    save_table_edits,
+    sync_sources_from_well_contents as service_sync_sources_from_well_contents,
+)
+from services.transfer_service import (
+    filtered_transfer_preview as service_filtered_transfer_preview,
+    regenerate_derived_tables as service_regenerate_derived_tables,
+    source_volume_summary as service_source_volume_summary,
+    transfer_preview_table as service_transfer_preview_table,
+)
+from services.validation_service import (
+    run_validation as service_run_validation,
+    validation_passed,
+)
+from workflows.layout_generator import build_plate_matrix
 
 
 APP_DIR = Path(__file__).parent
@@ -93,6 +105,12 @@ def initialize_state() -> None:
         "pending_operations": [],
         "pending_diff": pd.DataFrame(),
         "correction_chat": [],
+        "original_protocol": "",
+        "initial_plate_layout": pd.DataFrame(columns=PLATE_LAYOUT_COLUMNS),
+        "initial_well_contents": pd.DataFrame(columns=WELL_CONTENT_COLUMNS),
+        "initial_source_map": pd.DataFrame(),
+        "edit_history": [],
+        "last_correction_context": {},
         "ai_review": "",
         "confirmed": False,
         "llm_provider": saved_llm.get("provider", "OpenRouter"),
@@ -105,55 +123,40 @@ def initialize_state() -> None:
 
 
 def regenerate_derived_tables() -> None:
-    spec = st.session_state.spec
-    if not spec:
-        return
-    st.session_state.plate_layout = ensure_columns(st.session_state.plate_layout, PLATE_LAYOUT_COLUMNS)
-    st.session_state.well_contents = ensure_columns(st.session_state.well_contents, WELL_CONTENT_COLUMNS)
-    st.session_state.source_map = generate_source_map(st.session_state.well_contents, spec)
-    st.session_state.summary_matrix = summary_matrix(st.session_state.plate_layout)
+    result = service_regenerate_derived_tables(
+        st.session_state.plate_layout,
+        st.session_state.well_contents,
+        st.session_state.spec,
+    )
+    for key, value in result.items():
+        st.session_state[key] = value
 
 
 def run_validation() -> pd.DataFrame:
-    spec = st.session_state.spec or {}
-    expected_total = spec.get("expected_total_volume_ul")
     regenerate_derived_tables()
-    results = []
-    results.extend(validate_layout(st.session_state.plate_layout))
-    results.extend(validate_volumes(st.session_state.well_contents, expected_total))
-    results.extend(validate_sources(st.session_state.well_contents, st.session_state.source_map))
-    report = validation_results_to_df(results)
-    st.session_state.validation_report = report
-    passed = validation_passed(report)
-    st.session_state.transfer_table = (
-        compile_hamilton_transfers(st.session_state.well_contents, spec.get("destination_labware", "Plate_96"))
-        if passed
-        else pd.DataFrame(columns=TRANSFER_COLUMNS)
+    result = service_run_validation(
+        st.session_state.plate_layout,
+        st.session_state.well_contents,
+        st.session_state.source_map,
+        st.session_state.spec,
     )
+    st.session_state.validation_report = result["validation_report"]
+    st.session_state.transfer_table = result["transfer_table"]
     st.session_state.confirmed = False
-    return report
-
-
-def validation_passed(report: pd.DataFrame) -> bool:
-    if report.empty:
-        return False
-    blocking = report[report["severity"].isin(["error", "critical"]) & (report["status"] != "PASS")]
-    return blocking.empty
+    return result["validation_report"]
 
 
 def transfer_preview_table() -> pd.DataFrame:
-    spec = st.session_state.spec or {}
-    destination_labware = spec.get("destination_labware", "Plate_96")
-    return compile_hamilton_transfers(st.session_state.well_contents, destination_labware)
+    return service_transfer_preview_table(st.session_state.well_contents, st.session_state.spec)
 
 
 def filtered_transfer_preview(liquids: list[str], wells: list[str]) -> pd.DataFrame:
-    preview = transfer_preview_table()
-    if liquids:
-        preview = preview[preview["liquid_name"].astype(str).isin(liquids)]
-    if wells:
-        preview = preview[preview["destination_well"].astype(str).isin(wells)]
-    return preview.reset_index(drop=True)
+    return service_filtered_transfer_preview(
+        st.session_state.well_contents,
+        st.session_state.spec,
+        liquids,
+        wells,
+    )
 
 
 def show_transfer_metrics(preview: pd.DataFrame) -> None:
@@ -221,22 +224,7 @@ def style_plate_matrix(matrix: pd.DataFrame, color: str):
 
 
 def source_volume_summary(source_map: pd.DataFrame) -> pd.DataFrame:
-    if source_map.empty:
-        return pd.DataFrame(columns=["source_labware", "available_volume_ul", "required_volume_ul", "status"])
-    summary = (
-        source_map.assign(
-            available_volume_ul=pd.to_numeric(source_map["available_volume_ul"], errors="coerce").fillna(0),
-            required_volume_ul=pd.to_numeric(source_map["required_volume_ul"], errors="coerce").fillna(0),
-        )
-        .groupby("source_labware", dropna=False)[["available_volume_ul", "required_volume_ul"]]
-        .sum()
-        .reset_index()
-    )
-    summary["status"] = summary.apply(
-        lambda row: "UNKNOWN" if row.available_volume_ul <= 0 else ("OK" if row.available_volume_ul >= row.required_volume_ul else "INSUFFICIENT"),
-        axis=1,
-    )
-    return summary
+    return service_source_volume_summary(source_map)
 
 
 def display_source_target_overview() -> None:
@@ -313,150 +301,89 @@ def display_source_target_overview() -> None:
 
 
 def save_source_edits(source_map: pd.DataFrame) -> None:
-    edited = ensure_columns(source_map, SOURCE_MAP_COLUMNS)
-    spec = st.session_state.spec or {}
-    spec_sources = {}
-
-    for row in edited.itertuples(index=False):
-        liquid_name = str(row.liquid_name).strip()
-        liquid_role = str(row.liquid_role).strip()
-        source_labware = str(row.source_labware).strip()
-        source_well = str(row.source_well).strip().upper()
-        available_volume = pd.to_numeric(row.available_volume_ul, errors="coerce")
-        if pd.isna(available_volume):
-            available_volume = 0.0
-
-        match = (
-            st.session_state.well_contents["liquid_name"].astype(str).str.strip().eq(liquid_name)
-            & st.session_state.well_contents["liquid_role"].astype(str).str.strip().eq(liquid_role)
-        )
-        st.session_state.well_contents.loc[match, "source_labware"] = source_labware
-        st.session_state.well_contents.loc[match, "source_well"] = source_well
-        spec_sources[f"{liquid_role}:{liquid_name}:{source_labware}:{source_well}"] = {
-            "liquid_name": liquid_name,
-            "liquid_role": liquid_role,
-            "source_labware": source_labware,
-            "source_well": source_well,
-            "available_volume_ul": float(available_volume),
-        }
-
-    spec["sources"] = spec_sources
+    spec, well_contents = service_save_source_edits(
+        source_map,
+        st.session_state.well_contents,
+        st.session_state.spec,
+    )
     st.session_state.spec = spec
+    st.session_state.well_contents = well_contents
 
 
 def sync_sources_from_well_contents() -> None:
-    spec = st.session_state.spec or {}
-    previous_source_map = ensure_columns(st.session_state.source_map, SOURCE_MAP_COLUMNS)
-    availability_by_liquid = {}
-    for row in previous_source_map.itertuples(index=False):
-        key = (str(row.liquid_name).strip(), str(row.liquid_role).strip())
-        available_volume = pd.to_numeric(row.available_volume_ul, errors="coerce")
-        availability_by_liquid[key] = 0.0 if pd.isna(available_volume) else float(available_volume)
-
-    spec_sources = {}
-    content_sources = (
-        st.session_state.well_contents[
-            ["liquid_name", "liquid_role", "source_labware", "source_well"]
-        ]
-        .drop_duplicates()
-        .reset_index(drop=True)
+    st.session_state.spec = service_sync_sources_from_well_contents(
+        st.session_state.spec,
+        st.session_state.well_contents,
+        st.session_state.source_map,
     )
-    for row in content_sources.itertuples(index=False):
-        liquid_name = str(row.liquid_name).strip()
-        liquid_role = str(row.liquid_role).strip()
-        source_labware = str(row.source_labware).strip()
-        source_well = str(row.source_well).strip().upper()
-        available_volume = availability_by_liquid.get((liquid_name, liquid_role), 0.0)
-        spec_sources[f"{liquid_role}:{liquid_name}:{source_labware}:{source_well}"] = {
-            "liquid_name": liquid_name,
-            "liquid_role": liquid_role,
-            "source_labware": source_labware,
-            "source_well": source_well,
-            "available_volume_ul": available_volume,
-        }
 
-    spec["sources"] = spec_sources
-    st.session_state.spec = spec
+
+def build_correction_context(command: str) -> dict:
+    return service_build_correction_context(
+        command,
+        original_protocol=st.session_state.original_protocol,
+        initial_plate_layout=st.session_state.initial_plate_layout,
+        initial_well_contents=st.session_state.initial_well_contents,
+        initial_source_map=st.session_state.initial_source_map,
+        current_plate_layout=st.session_state.plate_layout,
+        current_well_contents=st.session_state.well_contents,
+        current_source_map=st.session_state.source_map,
+        edit_history=st.session_state.edit_history,
+        correction_chat=st.session_state.correction_chat,
+    )
 
 
 def generate_draft_layout() -> None:
-    spec = protocol_to_layout(
+    result = generate_draft_experiment(
         st.session_state.protocol,
         provider=st.session_state.llm_provider,
         model=st.session_state.llm_model,
         api_key=resolve_api_key(st.session_state.llm_provider, st.session_state.llm_api_key),
     )
-    st.session_state.spec = spec
-    st.session_state.plate_layout = spec["plate_layout"]
-    st.session_state.well_contents = generate_well_contents(st.session_state.plate_layout, spec)
-    st.session_state.diff = pd.DataFrame()
-    st.session_state.parsed_operations = []
-    st.session_state.pending_operations = []
-    st.session_state.pending_diff = pd.DataFrame()
-    st.session_state.correction_chat = []
-    st.session_state.ai_review = ""
-    st.session_state.confirmed = False
-    regenerate_derived_tables()
-    run_validation()
+    for key, value in result.items():
+        st.session_state[key] = value
 
 
 def interpret_correction() -> None:
-    command = st.session_state.correction_command.strip()
-    if not command:
-        raise ValueError("Enter a correction command first.")
-    operations = parse_correction_command(
-        command,
+    result = interpret_correction_command(
+        st.session_state.correction_command,
         provider=st.session_state.llm_provider,
         model=st.session_state.llm_model,
         api_key=resolve_api_key(st.session_state.llm_provider, st.session_state.llm_api_key),
+        original_protocol=st.session_state.original_protocol,
+        initial_plate_layout=st.session_state.initial_plate_layout,
+        initial_well_contents=st.session_state.initial_well_contents,
+        initial_source_map=st.session_state.initial_source_map,
+        plate_layout=st.session_state.plate_layout,
+        well_contents=st.session_state.well_contents,
+        source_map=st.session_state.source_map,
+        edit_history=st.session_state.edit_history,
+        correction_chat=st.session_state.correction_chat,
     )
-    _, _, preview_diff = apply_layout_operations(
-        st.session_state.plate_layout,
-        st.session_state.well_contents,
-        operations,
-    )
-    st.session_state.pending_operations = operations
-    st.session_state.pending_diff = preview_diff
-    st.session_state.parsed_operations = operations
-    st.session_state.correction_chat.append(
-        {
-            "role": "user",
-            "message": command,
-        }
-    )
-    st.session_state.correction_chat.append(
-        {
-            "role": "assistant",
-            "message": summarize_operations(operations, preview_diff),
-        }
-    )
+    st.session_state.last_correction_context = result["last_correction_context"]
+    st.session_state.pending_operations = result["pending_operations"]
+    st.session_state.pending_diff = result["pending_diff"]
+    st.session_state.parsed_operations = result["parsed_operations"]
+    st.session_state.correction_chat.extend(result["chat_messages"])
 
 
 def apply_pending_correction() -> None:
     operations = st.session_state.pending_operations
-    if not operations:
-        raise ValueError("No pending correction to apply.")
-    before = st.session_state.plate_layout.copy()
-    layout, contents, diff = apply_layout_operations(
-        st.session_state.plate_layout,
-        st.session_state.well_contents,
-        operations,
+    command = (st.session_state.last_correction_context or {}).get("latest_user_command", st.session_state.correction_command)
+    result = apply_confirmed_correction(
+        plate_layout=st.session_state.plate_layout,
+        well_contents=st.session_state.well_contents,
+        source_map=st.session_state.source_map,
+        spec=st.session_state.spec,
+        operations=operations,
+        command=command,
+        edit_history=st.session_state.edit_history,
     )
-    st.session_state.plate_layout = layout
-    st.session_state.well_contents = contents
-    st.session_state.diff = diff if not diff.empty else build_diff(before, layout)
-    st.session_state.parsed_operations = operations
-    st.session_state.pending_operations = []
-    st.session_state.pending_diff = pd.DataFrame()
-    st.session_state.correction_chat.append(
-        {
-            "role": "assistant",
-            "message": "Applied the confirmed correction and reran validation.",
-        }
-    )
-    sync_sources_from_well_contents()
-    regenerate_derived_tables()
-    run_validation()
+    for key, value in result.items():
+        if key == "chat_messages":
+            st.session_state.correction_chat.extend(value)
+        else:
+            st.session_state[key] = value
 
 
 def reject_pending_correction() -> None:
@@ -471,53 +398,16 @@ def reject_pending_correction() -> None:
     st.session_state.pending_diff = pd.DataFrame()
 
 
-def summarize_operations(operations: list[dict], diff: pd.DataFrame) -> str:
-    if not operations:
-        return "I could not identify a concrete operation."
-
-    lines = ["I understand this as:"]
-    for operation in operations:
-        op = operation.get("op", "")
-        if op == "CONSOLIDATE_SOURCES":
-            lines.append(
-                f"- Put all source liquids into `{operation.get('source_labware', 'SourcePlate_1')}`, starting at `{operation.get('start_well', 'A1')}`."
-            )
-            lines.append("- Do not change the target plate layout.")
-        elif op == "CHANGE_SOURCE":
-            lines.append(
-                f"- Move `{operation.get('liquid_name', '')}` source to `{operation.get('source_labware', '')} {operation.get('source_well', '')}`."
-            )
-        elif op == "CHANGE_VOLUME":
-            lines.append(f"- Change `{operation.get('liquid_name', '')}` volume to `{operation.get('volume_ul', '')} uL`.")
-        elif op == "MOVE_WELL":
-            lines.append(f"- Move target well `{operation.get('source_well', '')}` to `{operation.get('dest_well', '')}`.")
-        elif op == "SWAP_WELLS":
-            lines.append(f"- Swap target wells `{operation.get('well_a', '')}` and `{operation.get('well_b', '')}`.")
-        elif op == "AVOID_WELLS":
-            lines.append(f"- Avoid target wells `{', '.join(operation.get('wells', []))}`.")
-        elif op in {"FILL_BY_ROW", "FILL_BY_COLUMN", "GROUP_BY", "ADD_REPLICATE", "REMOVE_REPLICATE"}:
-            lines.append(f"- Apply `{op}` with parameters `{operation}`.")
-        else:
-            lines.append(f"- Apply `{op}` with parameters `{operation}`.")
-
-    if diff.empty:
-        lines.append("")
-        lines.append("Preview result: no rows would change. You may need to clarify the command.")
-    else:
-        lines.append("")
-        lines.append(f"Preview result: `{len(diff)}` row-level changes would be made.")
-    lines.append("Review this, then choose Apply or Reject.")
-    return "\n".join(lines)
-
-
 def save_direct_edits(plate_layout: pd.DataFrame, well_contents: pd.DataFrame, source_map: pd.DataFrame) -> None:
-    before = st.session_state.plate_layout.copy()
-    st.session_state.plate_layout = ensure_columns(plate_layout, PLATE_LAYOUT_COLUMNS)
-    st.session_state.well_contents = ensure_columns(well_contents, WELL_CONTENT_COLUMNS)
-    save_source_edits(source_map)
-    st.session_state.diff = build_diff(before, st.session_state.plate_layout)
-    regenerate_derived_tables()
-    run_validation()
+    result = save_table_edits(
+        st.session_state.plate_layout,
+        plate_layout,
+        well_contents,
+        source_map,
+        st.session_state.spec,
+    )
+    for key, value in result.items():
+        st.session_state[key] = value
 
 
 def main() -> None:
@@ -691,6 +581,26 @@ def main() -> None:
             st.info("No applied changes to show yet.")
         else:
             st.dataframe(st.session_state.diff, use_container_width=True, hide_index=True)
+        st.subheader("Experiment Memory")
+        if st.button("Clear Edit History", key="clear_edit_history_chat"):
+            st.session_state.edit_history = []
+            st.success("Edit history cleared. Current tables were not changed.")
+        with st.expander("Memory Debug View"):
+            st.markdown("**Original Protocol**")
+            st.text(st.session_state.original_protocol or "(not captured yet)")
+            st.markdown("**Initial Draft Summary**")
+            st.text(
+                "Plate layout:\n"
+                + summarize_dataframe_for_llm(st.session_state.initial_plate_layout, max_rows=12)
+                + "\nWell contents:\n"
+                + summarize_dataframe_for_llm(st.session_state.initial_well_contents, max_rows=12)
+                + "\nSource map:\n"
+                + summarize_dataframe_for_llm(st.session_state.initial_source_map, max_rows=12)
+            )
+            st.markdown("**Applied Edit History**")
+            st.json(st.session_state.edit_history)
+            st.markdown("**Last Correction Context**")
+            st.json(st.session_state.last_correction_context)
         st.subheader("Ask AI To Review")
         if st.button("Ask AI to Review"):
             try:
@@ -751,6 +661,25 @@ def main() -> None:
         )
 
     with raw_tab:
+        st.subheader("Experiment Memory")
+        if st.button("Clear Edit History", key="clear_edit_history_raw"):
+            st.session_state.edit_history = []
+            st.success("Edit history cleared. Current tables were not changed.")
+        st.markdown("**Original Protocol**")
+        st.text(st.session_state.original_protocol or "(not captured yet)")
+        st.markdown("**Initial Draft Summary**")
+        st.text(
+            "Plate layout:\n"
+            + summarize_dataframe_for_llm(st.session_state.initial_plate_layout, max_rows=12)
+            + "\nWell contents:\n"
+            + summarize_dataframe_for_llm(st.session_state.initial_well_contents, max_rows=12)
+            + "\nSource map:\n"
+            + summarize_dataframe_for_llm(st.session_state.initial_source_map, max_rows=12)
+        )
+        st.markdown("**Applied Edit History**")
+        st.json(st.session_state.edit_history)
+        st.markdown("**Last Correction Context**")
+        st.json(st.session_state.last_correction_context)
         st.subheader("Plate Layout")
         st.dataframe(st.session_state.plate_layout, use_container_width=True, hide_index=True)
         st.subheader("Well Contents")

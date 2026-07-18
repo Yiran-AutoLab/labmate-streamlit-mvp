@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from models.plate_models import ValidationResult
+from models.plate_models import ValidationResult, is_valid_well
 
 
 def validate_sources(well_contents: pd.DataFrame, source_map: pd.DataFrame) -> list[ValidationResult]:
@@ -11,6 +11,10 @@ def validate_sources(well_contents: pd.DataFrame, source_map: pd.DataFrame) -> l
         well_contents.get("source_labware", "").astype(str).str.strip().eq("")
         | well_contents.get("source_well", "").astype(str).str.strip().eq("")
     ]
+    source_wells = well_contents.get("source_well", pd.Series(dtype=str)).astype(str).str.strip().str.upper()
+    invalid_source_wells = sorted(
+        set(source_wells[(source_wells != "") & ~source_wells.map(is_valid_well)].tolist())
+    )
     insufficient = source_map[source_map.get("status", "").astype(str) == "INSUFFICIENT"]
     unknown = source_map[source_map.get("status", "").astype(str) == "UNKNOWN"]
     ntc_template = well_contents[
@@ -24,6 +28,16 @@ def validate_sources(well_contents: pd.DataFrame, source_map: pd.DataFrame) -> l
             "PASS" if missing_source.empty else "FAIL",
             "All liquids have source labware and source wells." if missing_source.empty else f"{len(missing_source)} rows are missing source locations.",
             "error" if not missing_source.empty else "info",
+        )
+    )
+    results.append(
+        ValidationResult(
+            "valid_source_well_addresses",
+            "PASS" if not invalid_source_wells else "FAIL",
+            "All source wells are valid 96-well addresses."
+            if not invalid_source_wells
+            else f"Invalid source wells: {', '.join(invalid_source_wells)}",
+            "error" if invalid_source_wells else "info",
         )
     )
     results.append(
